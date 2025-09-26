@@ -303,7 +303,23 @@ huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 --local-dir ./models/
 python ./utils/convert-helper-bitnet.py ./models/bitnet-b1.58-2B-4T-bf16
 ```
 
-### FAQ (Frequently Asked Questions)📌 
+### Export 4-bit Models to the Ternary Multiplane Format
+
+The new `utils/export_ternary_model.py` helper converts standard 4-bit checkpoints
+into the multiplane ternary layout required by the updated kernels. The script
+first quantizes linear layers to 4-bit groups, decomposes each weight into three
+balanced ternary planes, and writes the packed representation alongside the
+scaling metadata expected by `bitnet_multiplane_gemv`.
+
+```sh
+python utils/export_ternary_model.py --model gpt2 --output models/gpt2.ternary --verify
+```
+
+The command above downloads the specified model from Hugging Face, exports it to
+`models/gpt2.ternary`, and performs a structural verification pass. A matching
+JSON metadata file is written next to the binary for inspection.
+
+### FAQ (Frequently Asked Questions)📌
 
 #### Q1: The build dies with errors building llama.cpp due to issues with std::chrono in log.cpp?
 

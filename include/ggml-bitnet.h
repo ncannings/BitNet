@@ -3,6 +3,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <stdint.h>
+#include <stdio.h>
+
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 typedef float32_t bitnet_float_type;
@@ -22,6 +25,17 @@ struct bitnet_tensor_extra {
     bitnet_float_type * scales;
 };
 
+struct ternary_multiplane_tensor {
+    uint8_t * pos_masks[3];
+    uint8_t * neg_masks[3];
+    float plane_scales[3];
+    float * group_scales;
+    int32_t n_rows;
+    int32_t n_cols;
+    int32_t group_size;
+    int32_t n_groups;
+};
+
 GGML_API void ggml_bitnet_init(void);
 GGML_API void ggml_bitnet_free(void);
 // src0->type == Q4_0/IQ2_XXS/IQ3_XXS
@@ -35,6 +49,24 @@ GGML_API void ggml_bitnet_mul_mat_task_compute(void * src0, void * scales, void 
 GGML_API void ggml_bitnet_transform_tensor(struct ggml_tensor * tensor);
 GGML_API int ggml_bitnet_get_type_bits(enum ggml_type type);
 GGML_API void ggml_bitnet_set_n_threads(int n_threads);
+GGML_API void bitnet_multiplane_gemv(
+    float * output,
+    const float * input,
+    const struct ternary_multiplane_tensor * weight,
+    int M,
+    int N);
+
+GGML_API void bitnet_gemv_ternary_plane(
+    float * output,
+    const float * input,
+    const uint8_t * pos_mask,
+    const uint8_t * neg_mask,
+    float scale,
+    int M,
+    int N);
+
+GGML_API struct ternary_multiplane_tensor * bitnet_load_multiplane_tensor(FILE * file);
+GGML_API void bitnet_free_multiplane_tensor(struct ternary_multiplane_tensor * tensor);
 #if defined(GGML_BITNET_ARM_TL1)
 GGML_API void ggml_qgemm_lut(int m, int k, void* A, void* LUT, void* Scales, void* LUT_Scales, void* C);
 GGML_API void ggml_preprocessor(int m, int k, void* B, void* LUT_Scales, void* QLUT);

@@ -157,6 +157,9 @@ This project is based on the [llama.cpp](https://github.com/ggerganov/llama.cpp)
 
 ## Installation
 
+If you hit platform-specific build issues, check the
+[troubleshooting guide](docs/troubleshooting.md) for workarounds.
+
 ### Requirements
 - python>=3.9
 - cmake>=3.22
@@ -203,7 +206,7 @@ usage: setup_env.py [-h] [--hf-repo {1bitLLM/bitnet_b1_58-large,1bitLLM/bitnet_b
 
 Setup the environment for running inference
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   --hf-repo {1bitLLM/bitnet_b1_58-large,1bitLLM/bitnet_b1_58-3B,HF1BitLLM/Llama3-8B-1.58-100B-tokens,tiiuae/Falcon3-1B-Instruct-1.58bit,tiiuae/Falcon3-3B-Instruct-1.58bit,tiiuae/Falcon3-7B-Instruct-1.58bit,tiiuae/Falcon3-10B-Instruct-1.58bit}, -hr {1bitLLM/bitnet_b1_58-large,1bitLLM/bitnet_b1_58-3B,HF1BitLLM/Llama3-8B-1.58-100B-tokens,tiiuae/Falcon3-1B-Instruct-1.58bit,tiiuae/Falcon3-3B-Instruct-1.58bit,tiiuae/Falcon3-7B-Instruct-1.58bit,tiiuae/Falcon3-10B-Instruct-1.58bit}
                         Model used for inference
@@ -223,7 +226,8 @@ optional arguments:
 python run_inference.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -p "You are a helpful assistant" -cnv
 ```
 <pre>
-usage: run_inference.py [-h] [-m MODEL] [-n N_PREDICT] -p PROMPT [-t THREADS] [-c CTX_SIZE] [-temp TEMPERATURE] [-cnv]
+usage: run_inference.py [-h] [-m MODEL] [-n N_PREDICT] -p PROMPT [-t THREADS] [-c CTX_SIZE] [-temp TEMPERATURE]
+                        [--hf-base HF_BASE] [-cnv]
 
 Run inference
 
@@ -241,6 +245,8 @@ optional arguments:
                         Size of the prompt context
   -temp TEMPERATURE, --temperature TEMPERATURE
                         Temperature, a hyperparameter that controls the randomness of the generated text
+  --hf-base HF_BASE     Override the Hugging Face model identifier to use when hydrating ternary exports. This is useful if
+                        the export metadata is missing or you want to use a local path.
   -cnv, --conversation  Whether to enable chat mode or not (for instruct models.)
                         (When this option is turned on, the prompt specified by -p will be used as the system prompt.)
 </pre>
@@ -303,7 +309,47 @@ huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 --local-dir ./models/
 python ./utils/convert-helper-bitnet.py ./models/bitnet-b1.58-2B-4T-bf16
 ```
 
-### FAQ (Frequently Asked Questions)📌 
+### Export 4-bit Models to the Ternary Multiplane Format
+
+The new `utils/export_ternary_model.py` helper converts standard 4-bit checkpoints
+into the multiplane ternary layout required by the updated kernels. The script
+first quantizes linear layers to 4-bit groups, decomposes each weight into three
+balanced ternary planes, and writes the packed representation alongside the
+scaling metadata expected by `bitnet_multiplane_gemv`.
+
+```sh
+python utils/export_ternary_model.py --model gpt2 --output models/gpt2.ternary --verify
+```
+
+The command above downloads the specified model from Hugging Face, exports it to
+`models/gpt2.ternary`, and performs a structural verification pass. A matching
+JSON metadata file is written next to the binary for inspection.
+
+### Running Inference with Ternary Models
+
+`run_inference.py` now understands both the traditional GGUF checkpoints and the
+new ternary multiplane exports. When the supplied `--model` argument ends with
+`.ternary`, the script loads the companion JSON metadata, hydrates the ternary
+weights back into the base Hugging Face architecture, and generates text via the
+`transformers` runtime. The interface matches the existing CLI so you can reuse
+your prompts:
+
+```sh
+python run_inference.py -m models/gpt2.ternary -p "Once upon a time" -n 64
+```
+
+If your export is missing the originating Hugging Face identifier (or you want
+to override it with a local checkpoint path), pass `--hf-base` to specify the
+model to hydrate against:
+
+```sh
+python run_inference.py -m models/gpt2.ternary -p "Once upon a time" -n 64 --hf-base gpt2
+```
+
+The HTTP server in `run_inference_server.py` continues to target GGUF models.
+Ternary support will be added in a future update.
+
+### FAQ (Frequently Asked Questions)📌
 
 #### Q1: The build dies with errors building llama.cpp due to issues with std::chrono in log.cpp?
 

@@ -1,0 +1,111 @@
+from pathlib import Path
+import sys
+
+import numpy as np
+
+from transformers import LlamaConfig, LlamaForCausalLM
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from run_inference import _apply_ternary_weights
+from utils.ternary_loader import TernaryLayer, TernaryModel, TernaryPlane
+
+
+def _make_ternary_layer(name: str, weights: np.ndarray) -> TernaryLayer:
+    weights = np.asarray(weights, dtype=np.float32)
+    flat = weights.reshape(-1)
+    if weights.ndim == 0:
+        shape = ()
+        group_size = 1
+    else:
+        shape = weights.shape
+        group_size = shape[-1] if shape[-1] > 0 else 1
+
+    total = flat.size
+    if group_size <= 0:
+        group_size = 1
+    n_groups = int(np.ceil(total / group_size)) if total else 0
+    group_scales = np.ones((n_groups,), dtype=np.float32)
+
+    def pack(bits: np.ndarray) -> np.ndarray:
+        if bits.size == 0:
+            return np.zeros((0,), dtype=np.uint8)
+        return np.packbits(bits.astype(np.uint8), bitorder="little")
+
+    positive = pack(flat > 0)
+    negative = pack(flat < 0)
+    zero_mask = np.zeros_like(positive)
+
+    planes = [
+        TernaryPlane(pos_mask=positive, neg_mask=negative),
+        TernaryPlane(pos_mask=zero_mask, neg_mask=zero_mask),
+        TernaryPlane(pos_mask=zero_mask, neg_mask=zero_mask),
+    ]
+
+    plane_scales = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    return TernaryLayer(
+        name=name,
+        shape=shape,
+        group_size=int(group_size),
+        group_scales=group_scales,
+        plane_scales=plane_scales,
+        planes=planes,
+        bias=None,
+    )
+
+
+def test_apply_ternary_weights_resolves_llama_cpp_aliases():
+    config = LlamaConfig(
+        vocab_size=16,
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+    )
+    model = LlamaForCausalLM(config)
+
+    q_weight = np.array(
+        [
+            [1, -1, 0, 1],
+            [-1, 1, 1, -1],
+            [0, 1, -1, 1],
+            [1, 0, -1, -1],
+        ],
+        dtype=np.float32,
+    )
+    norm_weight = np.array([1.0, -1.0, 0.0, 1.0], dtype=np.float32)
+    lm_head_weight = np.array(
+        [
+            [1, -1, 0, 1, -1, 1, 0, -1, 1, 0, -1, 1, 0, 1, -1, 0],
+            [-1, 1, 1, -1, 0, -1, 1, 0, -1, 1, 0, -1, 1, 0, 1, -1],
+            [0, 1, -1, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1],
+            [1, 0, -1, -1, 1, -1, 0, 1, -1, 0, 1, -1, 0, 1, -1, 0],
+        ],
+        dtype=np.float32,
+    )
+
+    layers = {
+        "blk.0.attn_q.weight": _make_ternary_layer("blk.0.attn_q.weight", q_weight),
+        "blk.0.attn_norm.weight": _make_ternary_layer("blk.0.attn_norm.weight", norm_weight),
+        "output.weight": _make_ternary_layer("output.weight", lm_head_weight),
+    }
+
+    ternary_model = TernaryModel(layers=layers, metadata={})
+
+    _apply_ternary_weights(model, ternary_model)
+
+    q_proj_weight = (
+        model.model.layers[0].self_attn.q_proj.weight.detach().cpu().numpy()
+    )
+    assert np.allclose(q_proj_weight, q_weight)
+
+    norm_tensor = (
+        model.model.layers[0].input_layernorm.weight.detach().cpu().numpy()
+    )
+    assert np.allclose(norm_tensor, norm_weight)
+
+    lm_head_tensor = model.lm_head.weight.detach().cpu().numpy()
+    assert np.allclose(lm_head_tensor, lm_head_weight.T)
+

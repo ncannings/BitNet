@@ -1,11 +1,12 @@
 import argparse
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from utils.ternary_loader import (
     TernaryModel,
@@ -75,6 +76,90 @@ def _load_transformers():
     return AutoModelForCausalLM, AutoTokenizer
 
 
+_LLAMA_CPP_STATIC_ALIASES = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "token_embd.bias": "model.embed_tokens.bias",
+    "output.weight": "lm_head.weight",
+    "output.bias": "lm_head.bias",
+    "output_norm.weight": "model.norm.weight",
+    "output_norm.bias": "model.norm.bias",
+}
+
+
+_LLAMA_CPP_PATTERN_ALIASES = [
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.attn_q\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.self_attn.q_proj.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.attn_k\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.self_attn.k_proj.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.attn_v\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.self_attn.v_proj.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.attn_output\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.self_attn.o_proj.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.attn_norm\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.input_layernorm.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.ffn_norm\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.post_attention_layernorm.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.ffn_up\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.mlp.up_proj.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.ffn_gate\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.mlp.gate_proj.{param}",
+    ),
+    (
+        re.compile(r"^blk\.(?P<i>\d+)\.ffn_down\.(?P<param>weight|bias)$"),
+        "model.layers.{i}.mlp.down_proj.{param}",
+    ),
+]
+
+
+def _alias_hf_name(layer_name: str) -> Optional[str]:
+    if layer_name in _LLAMA_CPP_STATIC_ALIASES:
+        return _LLAMA_CPP_STATIC_ALIASES[layer_name]
+    for pattern, target in _LLAMA_CPP_PATTERN_ALIASES:
+        match = pattern.match(layer_name)
+        if match:
+            return target.format(**match.groupdict())
+    return None
+
+
+def _resolve_module(named_modules: dict, layer_name: str) -> Tuple[Optional[object], Optional[str]]:
+    module = named_modules.get(layer_name)
+    if module is not None:
+        return module, "weight"
+
+    if "." in layer_name:
+        candidate_module, candidate_attr = layer_name.rsplit(".", 1)
+        module = named_modules.get(candidate_module)
+        if module is not None and hasattr(module, candidate_attr):
+            return module, candidate_attr
+
+    alias = _alias_hf_name(layer_name)
+    if alias:
+        if "." in alias:
+            module_name, attribute = alias.rsplit(".", 1)
+        else:
+            module_name, attribute = alias, "weight"
+        module = named_modules.get(module_name)
+        if module is not None and hasattr(module, attribute):
+            return module, attribute
+
+    return None, None
+
+
 def _prepare_hf_components(model_metadata: dict, hf_override: Optional[str]):
     AutoModelForCausalLM, AutoTokenizer = _load_transformers()
     model_name = hf_override or model_metadata.get("model_name")
@@ -96,17 +181,48 @@ def _apply_ternary_weights(model, ternary_model: TernaryModel):
 
     named_modules = dict(model.named_modules())
     for layer_name, layer in ternary_model.layers.items():
-        module = named_modules.get(layer_name)
-        if module is None or not hasattr(module, "weight"):
+        module, attribute = _resolve_module(named_modules, layer_name)
+        if module is None or attribute is None:
             print(f"Warning: layer '{layer_name}' not found in base model; skipping.")
             continue
 
         weights = materialize_layer(layer)
-        weight_tensor = torch.from_numpy(weights).to(module.weight.dtype)
-        module.weight.data.copy_(weight_tensor)
+        target_param = getattr(module, attribute, None)
+        if target_param is None:
+            print(
+                "Warning: resolved attribute '"
+                f"{attribute}' for layer '{layer_name}' missing on base model; skipping."
+            )
+            continue
 
-        if layer.bias is not None and getattr(module, "bias", None) is not None:
-            bias_tensor = torch.from_numpy(layer.bias).to(module.bias.dtype)
+        weight_tensor = torch.from_numpy(weights).to(
+            dtype=target_param.dtype, device=target_param.device
+        )
+
+        if weight_tensor.shape != target_param.shape:
+            if (
+                weight_tensor.ndim == target_param.ndim == 2
+                and weight_tensor.t().shape == target_param.shape
+            ):
+                weight_tensor = weight_tensor.t().contiguous()
+            else:
+                print(
+                    "Warning: layer '"
+                    f"{layer_name}' resolved to '{attribute}' with mismatched shape "
+                    f"{weight_tensor.shape} != {tuple(target_param.shape)}; skipping."
+                )
+                continue
+
+        target_param.data.copy_(weight_tensor)
+
+        if (
+            attribute != "bias"
+            and layer.bias is not None
+            and getattr(module, "bias", None) is not None
+        ):
+            bias_tensor = torch.from_numpy(layer.bias).to(
+                dtype=module.bias.dtype, device=module.bias.device
+            )
             module.bias.data.copy_(bias_tensor)
 
 

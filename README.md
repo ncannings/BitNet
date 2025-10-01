@@ -325,6 +325,7 @@ The command above downloads the specified model from Hugging Face, exports it to
 `models/gpt2.ternary`, and performs a structural verification pass. A matching
 JSON metadata file is written next to the binary for inspection.
 
+
 ### Running Inference with Ternary Models
 
 `run_inference.py` now understands both the traditional GGUF checkpoints and the
@@ -348,6 +349,9 @@ python run_inference.py -m models/gpt2.ternary -p "Once upon a time" -n 64 --hf-
 
 The HTTP server in `run_inference_server.py` continues to target GGUF models.
 Ternary support will be added in a future update.
+
+=======
+
 
 ### FAQ (Frequently Asked Questions)📌
 

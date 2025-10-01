@@ -136,6 +136,7 @@ def _alias_hf_name(layer_name: str) -> Optional[str]:
     return None
 
 
+
 def _resolve_module(
     named_modules: dict,
     named_parameters: dict,
@@ -199,6 +200,7 @@ def _apply_ternary_weights(model, ternary_model: TernaryModel):
         module, attribute = _resolve_module(
             named_modules, named_parameters, named_buffers, layer_name
         )
+
         if module is None or attribute is None:
             print(f"Warning: layer '{layer_name}' not found in base model; skipping.")
             continue
@@ -240,6 +242,7 @@ def _apply_ternary_weights(model, ternary_model: TernaryModel):
             bias_tensor = torch.from_numpy(layer.bias).to(
                 dtype=module.bias.dtype, device=module.bias.device
             )
+
             if bias_tensor.shape != module.bias.shape:
                 print(
                     "Warning: bias for layer '"
@@ -248,6 +251,7 @@ def _apply_ternary_weights(model, ternary_model: TernaryModel):
                 )
             else:
                 module.bias.data.copy_(bias_tensor)
+
 
 
 def run_ternary_inference(args):

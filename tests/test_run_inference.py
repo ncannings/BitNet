@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import torch
 
+
 from transformers import LlamaConfig, LlamaForCausalLM
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -12,9 +13,11 @@ from run_inference import _apply_ternary_weights
 from utils.ternary_loader import TernaryLayer, TernaryModel, TernaryPlane
 
 
+
 def _make_ternary_layer(
     name: str, weights: np.ndarray, bias: np.ndarray | None = None
 ) -> TernaryLayer:
+
     weights = np.asarray(weights, dtype=np.float32)
     flat = weights.reshape(-1)
     if weights.ndim == 0:
@@ -54,7 +57,9 @@ def _make_ternary_layer(
         group_scales=group_scales,
         plane_scales=plane_scales,
         planes=planes,
+
         bias=None if bias is None else np.asarray(bias, dtype=np.float32),
+
     )
 
 
@@ -111,6 +116,7 @@ def test_apply_ternary_weights_resolves_llama_cpp_aliases():
 
     lm_head_tensor = model.lm_head.weight.detach().cpu().numpy()
     assert np.allclose(lm_head_tensor, lm_head_weight.T)
+
 
 
 def test_apply_ternary_weights_handles_direct_hf_names():
@@ -194,4 +200,6 @@ def test_apply_ternary_weights_updates_bias_when_present():
 
     assert np.allclose(model.dense.weight.detach().cpu().numpy(), weight)
     assert np.allclose(model.dense.bias.detach().cpu().numpy(), bias)
+
+
 

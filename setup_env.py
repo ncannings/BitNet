@@ -7,6 +7,7 @@ import argparse
 import logging
 import shutil
 from pathlib import Path
+from typing import Optional, Sequence, Union
 
 logger = logging.getLogger("setup_env")
 
@@ -84,27 +85,88 @@ ARCH_ALIAS = {
 def system_info():
     return platform.system(), ARCH_ALIAS[platform.machine()]
 
+
+def _looks_like_ternary(path: Path) -> bool:
+    """Return ``True`` when *path* appears to be a ternary export."""
+
+    try:
+        with path.open("rb") as handle:
+            return handle.read(4) == b"TERN"
+    except OSError:
+        return False
+
+
+def resolve_ternary_artifact(model_path: Union[str, os.PathLike]) -> Optional[Path]:
+    """Detect ternary exports passed via ``--model-dir``.
+
+    Users often point ``--model-dir`` at either the directory that contains the
+    ``.ternary`` file or at the file itself. This helper normalises both cases
+    and returns the matching file path when one is found.
+    """
+
+    path = Path(model_path)
+
+    if path.is_file():
+        return path if _looks_like_ternary(path) else None
+
+    if path.is_dir():
+        for candidate in sorted(path.glob("*.ternary")):
+            if _looks_like_ternary(candidate):
+                return candidate
+
+    return None
+
 def get_model_name():
     if args.hf_repo:
         return SUPPORTED_HF_MODELS[args.hf_repo]["model_name"]
     return os.path.basename(os.path.normpath(args.model_dir))
 
-def run_command(command, shell=False, log_step=None):
-    """Run a system command and ensure it succeeds."""
+def _format_command(command: Union[str, Sequence[str]]) -> str:
+    if isinstance(command, str):
+        return command
+    return " ".join(str(token) for token in command)
+
+
+def run_command(command: Union[str, Sequence[str]], *, shell: bool = False, log_step: Optional[str] = None):
+    """Run a system command and ensure it succeeds.
+
+    When ``log_step`` is provided the stdout/stderr streams are redirected to a
+    per-step log file inside ``args.log_dir`` so that users can inspect the
+    detailed build output when something goes wrong.
+    """
+
+    log_file_handle = None
+    log_file_path: Optional[Path] = None
+
     if log_step:
-        log_file = os.path.join(args.log_dir, log_step + ".log")
-        with open(log_file, "w") as f:
-            try:
-                subprocess.run(command, shell=shell, check=True, stdout=f, stderr=f)
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Error occurred while running command: {e}, check details in {log_file}")
-                sys.exit(1)
-    else:
-        try:
-            subprocess.run(command, shell=shell, check=True)
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Error occurred while running command: {e}")
+        log_dir = Path(args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_dir / f"{log_step}.log"
+        log_file_handle = open(log_file_path, "w", encoding="utf-8")
+
+    logging.info("Running command: %s", _format_command(command))
+
+    try:
+        subprocess.run(
+            command,
+            shell=shell,
+            check=True,
+            stdout=log_file_handle,
+            stderr=log_file_handle,
+        )
+    except subprocess.CalledProcessError as exc:
+        if log_file_path is not None:
+            logging.error(
+                "Error occurred while running command (see %s for details): %s",
+                log_file_path,
+                exc,
+            )
+        else:
+            logging.error("Error occurred while running command: %s", exc)
         sys.exit(1)
+    finally:
+        if log_file_handle is not None:
+            log_file_handle.close()
 
 def prepare_model():
     _, arch = system_info()
@@ -112,22 +174,37 @@ def prepare_model():
     model_dir = args.model_dir
     quant_type = args.quant_type
     quant_embd = args.quant_embd
+    ternary_artifact = resolve_ternary_artifact(model_dir)
+
     if hf_url is not None:
         # download the model
         model_dir = os.path.join(model_dir, SUPPORTED_HF_MODELS[hf_url]["model_name"])
         Path(model_dir).mkdir(parents=True, exist_ok=True)
         logging.info(f"Downloading model {hf_url} from HuggingFace to {model_dir}...")
         run_command(["huggingface-cli", "download", hf_url, "--local-dir", model_dir], log_step="download_model")
-    elif not os.path.exists(model_dir):
+    elif ternary_artifact is None and not os.path.exists(model_dir):
         logging.error(f"Model directory {model_dir} does not exist.")
         sys.exit(1)
     else:
+        if ternary_artifact is not None:
+            logging.info("Detected ternary export at %s; skipping GGUF preparation.", ternary_artifact)
+            return
+
         logging.info(f"Loading model from directory {model_dir}.")
     gguf_path = os.path.join(model_dir, "ggml-model-" + quant_type + ".gguf")
     if not os.path.exists(gguf_path) or os.path.getsize(gguf_path) == 0:
         logging.info(f"Converting HF model to GGUF format...")
         if quant_type.startswith("tl"):
-            run_command([sys.executable, "utils/convert-hf-to-gguf-bitnet.py", model_dir, "--outtype", quant_type, "--quant-embd"], log_step="convert_to_tl")
+            convert_cmd = [
+                sys.executable,
+                "utils/convert-hf-to-gguf-bitnet.py",
+                model_dir,
+                "--outtype",
+                quant_type,
+            ]
+            if quant_embd:
+                convert_cmd.append("--quant-embd")
+            run_command(convert_cmd, log_step="convert_to_tl")
         else: # i2s
             # convert to f32
             run_command([sys.executable, "utils/convert-hf-to-gguf-bitnet.py", model_dir, "--outtype", "f32"], log_step="convert_to_f32_gguf")
@@ -151,11 +228,45 @@ def prepare_model():
 
 def setup_gguf():
     # Install the pip package
+    requirements_file = Path("requirements.txt")
+    if requirements_file.exists():
+        run_command([sys.executable, "-m", "pip", "install", "-r", str(requirements_file)], log_step="install_requirements")
     run_command([sys.executable, "-m", "pip", "install", "3rdparty/llama.cpp/gguf-py"], log_step="install_gguf")
 
 def gen_code():
     _, arch = system_info()
-    
+
+    ternary_artifact = resolve_ternary_artifact(args.model_dir)
+    if ternary_artifact is not None:
+        logging.info("Running kernel code generation for ternary export %s", ternary_artifact)
+        if arch == "arm64":
+            run_command([
+                sys.executable,
+                "utils/codegen_tl1.py",
+                "--model",
+                "bitnet_b1_58-3B",
+                "--BM",
+                "160,320,320",
+                "--BK",
+                "64,128,64",
+                "--bm",
+                "32,64,32",
+            ], log_step="codegen")
+        else:
+            run_command([
+                sys.executable,
+                "utils/codegen_tl2.py",
+                "--model",
+                "bitnet_b1_58-3B",
+                "--BM",
+                "160,320,320",
+                "--BK",
+                "96,96,96",
+                "--bm",
+                "32,32,32",
+            ], log_step="codegen")
+        return
+
     llama3_f3_models = set([model['model_name'] for model in SUPPORTED_HF_MODELS.values() if model['model_name'].startswith("Falcon") or model['model_name'].startswith("Llama")])
 
     if arch == "arm64":
@@ -211,7 +322,17 @@ def compile():
         logging.error(f"Arch {arch} is not supported yet")
         exit(0)
     logging.info("Compiling the code using CMake.")
-    run_command(["cmake", "-B", "build", *COMPILER_EXTRA_ARGS[arch], *OS_EXTRA_ARGS.get(platform.system(), []), "-DCMAKE_C_COMPILER=clang", "-DCMAKE_CXX_COMPILER=clang++"], log_step="generate_build_files")
+    run_command([
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "build",
+        *COMPILER_EXTRA_ARGS[arch],
+        *OS_EXTRA_ARGS.get(platform.system(), []),
+        "-DCMAKE_C_COMPILER=clang",
+        "-DCMAKE_CXX_COMPILER=clang++",
+    ], log_step="generate_build_files")
     # run_command(["cmake", "--build", "build", "--target", "llama-cli", "--config", "Release"])
     run_command(["cmake", "--build", "build", "--config", "Release"], log_step="compile")
 
